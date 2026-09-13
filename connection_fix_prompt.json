@@ -1,0 +1,135 @@
+{
+  "task": "Simplify the DAQ connection strategy to a minimal Wi‑Fi UDP bridge and ensure telemetry flows from Teensy -> ESP32 -> DAQ, and DAQ commands flow from DAQ -> ESP32 -> Teensy.",
+  "goal": "Use the simplest stable architecture: DAQ and ESP32 talk over UDP on Wi‑Fi; ESP32 and Teensy talk over UART; no extra protocol layers, no duplicate command paths, no simulated telemetry.",
+  "architecture": {
+    "daq_to_esp32": "UDP JSON over Wi‑Fi to ESP32 IP 10.0.2.245:4210",
+    "esp32_to_teensy": "UART Serial1, pins RX=7 TX=8",
+    "teensy_to_esp32": "UART Serial1 telemetry lines",
+    "esp32_to_daq": "UDP JSON telemetry packet back to the GUI",
+    "packet_types": [
+      "HELLO",
+      "STATUS",
+      "DAQ_START",
+      "STOP",
+      "TELEMETRY"
+    ]
+  },
+  "rules": [
+    "Do not keep demo or simulation telemetry paths active in live UDP mode.",
+    "Do not rely on mDNS as the primary connection method for Windows. Use direct IP fallback and only optional mDNS discovery.",
+    "Use JSON only for DAQ <-> ESP32 commands and telemetry.",
+    "Keep the protocol very small and consistent.",
+    "On the ESP32, store the DAQ IP and port when the first UDP packet arrives.",
+    "When DAQ sends DAQ_START, ESP32 immediately forwards DAQ_START to Teensy over UART.",
+    "When Teensy sends telemetry, ESP32 parses it and forwards JSON back to the DAQ over UDP.",
+    "When DAQ sends STOP, ESP32 forwards STOP to Teensy and stops telemetry.",
+    "If no telemetry arrives, do not keep forcing ERROR state in the GUI; keep the socket connected and wait for the next packet.",
+    "Use the exact file structure and names already present in this project."
+  ],
+  "expected_behavior": {
+    "daq_connect": "The DAQ connects to ESP32 over UDP and sends HELLO.",
+    "esp32_handshake": "ESP32 replies with ACK/READY state and remembers DAQ client IP and port.",
+    "daq_start": "The DAQ sends {\"type\":\"DAQ_START\"}. The ESP32 forwards the same message to the Teensy over UART.",
+    "teensy_start": "The Teensy accepts one of START_COMMAND values and transitions to RUNNING state.",
+    "teensy_telemetry": "The Teensy generates TLM|... lines at 60 Hz while RUNNING.",
+    "esp32_forward": "ESP32 reads Serial1, parses TLM|..., builds JSON telemetry, and sends it back to the DAQ over UDP.",
+    "daq_gauges": "The DAQ parses the telemetry JSON and updates the gauges. If no packet arrives within 2.0 seconds, it marks timeout only for the UI, not as a network failure.",
+    "daq_stop": "The DAQ sends {\"type\":\"STOP\"}; ESP32 forwards STOP and Teensy stops telemetry."
+  },
+  "modifications": [
+    {
+      "file": "V 1/dashborad.py",
+      "changes": [
+        "Keep the direct IP fallback to 10.0.2.245:4210.",
+        "Only auto-send DAQ_START after a real socket connection succeeds, once.",
+        "Do not auto-trigger demo data while the real UDP mode is active.",
+        "Do not set the DAQ to ERROR just because no telemetry packet arrived in the first 2 seconds while waiting for the system to start; leave it connected and show a timeout state only.",
+        "For received JSON telemetry, normalize the fields using keys like rpm, throttle, fuel, cht, egt, vib_x, vib_y, vib_z."
+      ]
+    },
+    {
+      "file": "V 1/udp_connection.py",
+      "changes": [
+        "Keep UDP socket creation and receive loop simple and reliable.",
+        "Accept both command names and packet types: HELLO, HELLO, DAQ_START, STOP, STATUS, TELEMETRY.",
+        "Ignore case differences for message_type.",
+        "Emit telemetryReceived only for the actual telemetry packet type.",
+        "Do not parse or send unrelated profile or demo packets in live mode."
+      ]
+    },
+    {
+      "file": "firmware/ESP32/ESP32_DAQ/udp_manager.cpp",
+      "changes": [
+        "On UDP packet receive, parse the JSON and read type or command.",
+        "If type is HELLO or PING: reply {\"type\":\"ACK\",\"state\":\"READY\"} and keep the DAQ client address.",
+        "If type is DAQ_START: forward the command to the Teensy over Serial1 and reply ACK/RUNNING.",
+        "If type is STOP: forward STOP to Teensy and reply ACK/STOPPED.",
+        "If type is STATUS: reply {\"type\":\"STATUS\",\"state\":\"READY\"}.",
+        "If packet is telemetry from Teensy UART, the ESP32 must wrap it into JSON and send it back to the DAQ."
+      ]
+    },
+    {
+      "file": "firmware/ESP32/ESP32_DAQ/teensy_link.cpp",
+      "changes": [
+        "Start Serial1 with TEENSY_UART_BAUD, SERIAL_8N1, TEENSY_RX_PIN=7, TEENSY_TX_PIN=8.",
+        "Read lines from Serial1 on every loop.",
+        "Accept both TLM|... and TELEMETRY|... messages.",
+        "Parse keys exactly as: rpm, load1, load2, temp1, temp2, vibx, viby, vibz.",
+        "Build a JSON object like {\"type\":\"TELEMETRY\",\"state\":\"RUNNING\",\"data\":{...}} and send it to the DAQ over UDP via udpSendJson().",
+        "Ignore ACK and STATUS messages from the Teensy unless you intentionally want them for logs."
+      ]
+    },
+    {
+      "file": "firmware/ESP32/ESP32_DAQ/config.h",
+      "changes": [
+        "Confirm WiFi SSID and password are correct.",
+        "Keep UDP_PORT 4210.",
+        "Keep MDNS name engine-daq for optional discovery only.",
+        "Keep UART pins TEENSY_RX_PIN 7 and TEENSY_TX_PIN 8.",
+        "Keep DEBUG_MODE enabled for serial debugging."
+      ]
+    },
+    {
+      "file": "firmware/Teensy/Teensy_DAQ/config_manager.cpp",
+      "changes": [
+        "Set default state to STATE_READY during boot so the first DAQ_START can transition to RUNNING."
+      ]
+    },
+    {
+      "file": "firmware/Teensy/Teensy_DAQ/protocol.cpp",
+      "changes": [
+        "Process Serial and Serial1 commands together.",
+        "Accept START_COMMAND when state is IDLE, READY, or STOPPED.",
+        "When START_COMMAND is received: set gDaqState = STATE_RUNNING and reply ACK|state=RUNNING.",
+        "When STOP_COMMAND is received: set gDaqState = STATE_STOPPED and reply ACK|state=STOPPED.",
+        "When gDaqState == STATE_RUNNING, generate TLM|... telemetry each 1000/60 ms and send it over Serial1.",
+        "Keep the message format simple: TLM|rpm=...|load1=...|load2=...|temp1=...|temp2=...|vibx=...|viby=...|vibz=..."
+      ]
+    },
+    {
+      "file": "firmware/Teensy/Teensy_DAQ/protocol.h",
+      "changes": [
+        "Keep START_COMMAND = \"DAQ_START\" and STOP_COMMAND = \"STOP\".",
+        "Keep PING_COMMAND = \"PING\" and STATUS_COMMAND = \"GET_STATUS\"."
+      ]
+    }
+  ],
+  "implementation_order": [
+    "Update the Teensy state machine and telemetry generation first.",
+    "Update the ESP32 UART bridge and JSON UDP relay.",
+    "Update the DAQ UDP connection and start logic.",
+    "Build and flash the firmware.",
+    "Open the serial monitor for ESP32 and Teensy, then press connect in the DAQ GUI."
+  ],
+  "validation_steps": [
+    "Start DAQ GUI.",
+    "Connect to ESP32 on 10.0.2.245:4210.",
+    "Confirm ESP32 receives HELLO and replies READY.",
+    "Confirm DAQ sends DAQ_START.",
+    "Confirm ESP32 prints [ESP32] UDP RX: {\"type\":\"DAQ_START\"}.",
+    "Confirm ESP32 prints [ESP32] Teensy RX: TLM|....",
+    "Confirm DAQ prints telemetry packet received and gauge values update.",
+    "Confirm stop works and the Teensy stops emitting telemetry."
+  ],
+  "final_goal": "The final system must behave as a simple and stable telemetry bridge: DAQ sends command over Wi‑Fi UDP to ESP32; ESP32 forwards to Teensy over UART; Teensy emits telemetry; ESP32 forwards JSON back to the DAQ; DAQ updates gauges; no unnecessary startup loops or simulator logic."
+}

@@ -1,0 +1,8 @@
+{
+  "experiment_name": "Engine Test",
+  "test_id": "TEST-001",
+  "throttle_mode": "MANUAL",
+  "target_rpm": 6000,
+  "sample_rate": 200,
+  "status": "READY"
+}

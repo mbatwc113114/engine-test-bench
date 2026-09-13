@@ -1,0 +1,54 @@
+{
+  "teensy": {
+    "load_cells": {
+      "load_cell_1": {
+        "dt_pin": null,
+        "sck_pin": null
+      },
+      "load_cell_2": {
+        "dt_pin": null,
+        "sck_pin": null
+      }
+    },
+    "thermocouples": {
+      "tc1": {
+        "module": "MAX6675",
+        "cs_pin": null,
+        "sck_pin": null,
+        "so_pin": null
+      },
+      "tc2": {
+        "module": "MAX6675",
+        "cs_pin": null,
+        "sck_pin": null,
+        "so_pin": null
+      }
+    },
+    "vibration": {
+      "x": null,
+      "y": null,
+      "z": null
+    },
+    "sampling": {
+      "sensor_sample_rate_hz": 100,
+      "telemetry_rate_hz": 20,
+      "logging_rate_hz": 50
+    }
+  },
+  "esp32": {
+    "servo": {
+      "pin": null,
+      "min_us": 1000,
+      "max_us": 2000
+    },
+    "telemetry": {
+      "rate_hz": 20
+    },
+    "logging": {
+      "rate_hz": 100
+    },
+    "udp": {
+      "port": 5000
+    }
+  }
+}
