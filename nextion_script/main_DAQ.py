@@ -41,7 +41,7 @@ from PyQt5.QtCore import (
     Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QThread
 )
 from PyQt5.QtGui import (
-    QPixmap, QPainter, QPen, QBrush, QColor, QFont, QTransform, QDoubleValidator
+    QPixmap, QPainter, QPen, QBrush, QColor, QPalette, QFont, QTransform, QDoubleValidator
 )
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QComboBox,
@@ -1763,6 +1763,10 @@ class LegacyDAQMonitor(QtWidgets.QMainWindow):
         global running
 
         running = False
+
+        if hasattr(self, "vibration_page"):
+            self.vibration_page.timer.stop()
+            self.vibration_page.hide()
 
         event.accept()
 
@@ -4529,6 +4533,352 @@ class UDPSender:
             pass
 
 
+
+# ---------------------------------------------------------------------------
+# Live vibration analysis page
+# ---------------------------------------------------------------------------
+
+class VibrationAnalysisPage(QWidget):
+    """
+    Full-screen live vibration analysis page.
+
+    IMPORTANT:
+    - Uses the SAME raw 2 kHz vibration buffers already populated by the
+      existing Teensy serial reader.
+    - Does NOT open another serial port or start another acquisition thread.
+    - The three time-domain plots show raw X/Y/Z acceleration in g.
+    - The three FFT plots are calculated from the latest raw samples only.
+    - Existing DAQ acquisition, logging, UDP, SD download and dashboard
+      features are untouched.
+    """
+
+    FFT_SIZE = 2048
+    TIME_WINDOW_SECONDS = 5.0
+    UPDATE_INTERVAL_MS = 50       # 20 Hz analysis/display update
+    MAX_FFT_FREQ_HZ = 500.0
+
+    def __init__(self, parent=None, back_callback=None):
+        super().__init__(parent)
+        self.back_callback = back_callback
+        self._updating = False
+
+        self.setObjectName("VibrationAnalysisPage")
+        # Force an opaque black background so the dashboard behind this page
+        # cannot show through the vibration analysis view.
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAutoFillBackground(True)
+        palette = self.palette()
+        palette.setColor(QPalette.Window, QColor("#000000"))
+        self.setPalette(palette)
+        self.setStyleSheet("""
+            QWidget#VibrationAnalysisPage {
+                background: #090909;
+            }
+            QLabel {
+                color: #eeeeee;
+            }
+            QPushButton {
+                background: #333333;
+                color: white;
+                border: 1px solid #666666;
+                border-radius: 8px;
+                padding: 8px 18px;
+                font-size: 15px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background: #444444;
+            }
+            QPushButton:pressed {
+                background: #222222;
+            }
+        """)
+
+        self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.PreciseTimer)
+        self.timer.timeout.connect(self.update_plots)
+
+        self._build_ui()
+
+    def _build_ui(self):
+        main = QVBoxLayout(self)
+        main.setContentsMargins(18, 12, 18, 14)
+        main.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+
+        title = QLabel("LIVE VIBRATION ANALYSIS")
+        title.setStyleSheet(
+            "font-size:24px; font-weight:bold; color:#ffffff;"
+        )
+        header.addWidget(title)
+
+        self.status_label = QLabel(
+            "RAW ADXL335 | 2 kHz | FFT 2048 | 0–500 Hz"
+        )
+        self.status_label.setStyleSheet(
+            "font-size:13px; color:#aaaaaa;"
+        )
+        header.addWidget(self.status_label)
+        header.addStretch(1)
+
+        self.back_button = QPushButton("← BACK TO DAQ")
+        self.back_button.setMinimumWidth(170)
+        self.back_button.clicked.connect(self.go_back)
+        header.addWidget(self.back_button)
+
+        main.addLayout(header)
+
+        plots_grid = QGridLayout()
+        plots_grid.setContentsMargins(0, 0, 0, 0)
+        plots_grid.setHorizontalSpacing(8)
+        plots_grid.setVerticalSpacing(8)
+
+        self.time_plots = []
+        self.fft_plots = []
+        self.time_curves = []
+        self.fft_curves = []
+
+        axes = ["X", "Y", "Z"]
+        # Keep the same X/Y/Z convention used by the DAQ buffers.
+        pens = [
+            pg.mkPen(color="#ff3b30", width=1.6),
+            pg.mkPen(color="#34c759", width=1.6),
+            pg.mkPen(color="#0a84ff", width=1.6),
+        ]
+
+        for row, axis in enumerate(axes):
+            time_plot = pg.PlotWidget()
+            time_plot.setBackground("#050505")
+            time_plot.setTitle(
+                f"{axis} — RAW TIME DOMAIN",
+                color="#ffffff",
+                size="13pt"
+            )
+            time_plot.setLabel("left", "Acceleration", units="g")
+            time_plot.setLabel("bottom", "Time", units="s")
+            time_plot.showGrid(x=True, y=True, alpha=0.22)
+            time_plot.setMenuEnabled(False)
+            time_plot.setMouseEnabled(x=False, y=False)
+            time_plot.enableAutoRange(x=False, y=True)
+            time_plot.setYRange(-3.0, 3.0, padding=0.05)
+            # Fixed live time-domain axis: 0 to 5 seconds.
+            time_plot.setXRange(0.0, self.TIME_WINDOW_SECONDS, padding=0)
+            time_plot.setClipToView(True)
+
+            time_curve = time_plot.plot(pen=pens[row])
+            # Compatibility: configure downsampling on the curve, not PlotItem.
+            try:
+                time_curve.setDownsampling(auto=True, method="peak")
+            except TypeError:
+                time_curve.setDownsampling(auto=True)
+            time_curve.setClipToView(True)
+
+            fft_plot = pg.PlotWidget()
+            fft_plot.setBackground("#050505")
+            fft_plot.setTitle(
+                f"{axis} — FFT",
+                color="#ffffff",
+                size="13pt"
+            )
+            fft_plot.setLabel("left", "Amplitude", units="g")
+            fft_plot.setLabel("bottom", "Frequency", units="Hz")
+            fft_plot.showGrid(x=True, y=True, alpha=0.22)
+            fft_plot.setMenuEnabled(False)
+            fft_plot.setMouseEnabled(x=False, y=False)
+            fft_plot.setXRange(0.0, self.MAX_FFT_FREQ_HZ, padding=0)
+            fft_plot.setClipToView(True)
+
+            fft_curve = fft_plot.plot(pen=pens[row])
+            try:
+                fft_curve.setDownsampling(auto=True, method="peak")
+            except TypeError:
+                fft_curve.setDownsampling(auto=True)
+            fft_curve.setClipToView(True)
+
+            self.time_plots.append(time_plot)
+            self.fft_plots.append(fft_plot)
+            self.time_curves.append(time_curve)
+            self.fft_curves.append(fft_curve)
+
+            plots_grid.addWidget(time_plot, row, 0)
+            plots_grid.addWidget(fft_plot, row, 1)
+
+        plots_grid.setColumnStretch(0, 1)
+        plots_grid.setColumnStretch(1, 1)
+        for row in range(3):
+            plots_grid.setRowStretch(row, 1)
+
+        main.addLayout(plots_grid, 1)
+
+        footer = QHBoxLayout()
+        self.live_info = QLabel(
+            "Waiting for raw vibration samples..."
+        )
+        self.live_info.setStyleSheet(
+            "color:#aaaaaa; font-size:12px;"
+        )
+        footer.addWidget(self.live_info)
+        footer.addStretch(1)
+
+        self.range_info = QLabel(
+            "Time: 0–5.00 s | FFT: 2048 samples | Fs: 2000 Hz | Δf: 0.977 Hz"
+        )
+        self.range_info.setStyleSheet(
+            "color:#888888; font-size:12px;"
+        )
+        footer.addWidget(self.range_info)
+        main.addLayout(footer)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.timer.start(self.UPDATE_INTERVAL_MS)
+        # Draw immediately when the page opens.
+        QTimer.singleShot(0, self.update_plots)
+
+    def hideEvent(self, event):
+        self.timer.stop()
+        super().hideEvent(event)
+
+    @staticmethod
+    def _one_sided_fft(values):
+        """Return frequency/amplitude arrays for a real-valued raw signal."""
+        values = np.asarray(values, dtype=np.float64)
+        n = values.size
+        if n < 16:
+            return None, None
+
+        # Remove only DC offset for frequency-domain analysis.
+        # The raw time-domain data remains untouched.
+        signal = values - np.mean(values)
+
+        # Hann window reduces spectral leakage.
+        window = np.hanning(n)
+        coherent_gain = np.sum(window)
+        if coherent_gain <= 0.0:
+            return None, None
+
+        spectrum = np.fft.rfft(signal * window)
+        amplitude = np.abs(spectrum) * (2.0 / coherent_gain)
+        amplitude[0] *= 0.5
+        if n % 2 == 0 and amplitude.size > 1:
+            amplitude[-1] *= 0.5
+
+        frequency = np.fft.rfftfreq(n, d=1.0 / ACC_SAMPLE_RATE_HZ)
+        return frequency, amplitude
+
+    def _snapshot_raw_data(self):
+        with data_lock:
+            x = np.asarray(vib_x, dtype=np.float64)
+            y = np.asarray(vib_y, dtype=np.float64)
+            z = np.asarray(vib_z, dtype=np.float64)
+            sample_count = total_samples
+            packet_count = good_packets
+            crc_errors = bad_packets
+
+        return x, y, z, sample_count, packet_count, crc_errors
+
+    def update_plots(self):
+        if self._updating:
+            return
+        self._updating = True
+
+        try:
+            x, y, z, sample_count, packet_count, crc_errors = self._snapshot_raw_data()
+
+            if x.size == 0 or y.size == 0 or z.size == 0:
+                self.live_info.setText(
+                    "Waiting for raw ADXL335 samples from Teensy..."
+                )
+                return
+
+            n_time = min(
+                x.size,
+                y.size,
+                z.size,
+                int(ACC_SAMPLE_RATE_HZ * self.TIME_WINDOW_SECONDS)
+            )
+            if n_time < 2:
+                return
+
+            x_time = x[-n_time:]
+            y_time = y[-n_time:]
+            z_time = z[-n_time:]
+
+            # Fixed sample-based time axis. This is independent of USB packet
+            # arrival jitter and therefore gives a true 2 kHz time scale.
+            # Fixed 0–5 s time axis. When the buffer is not full yet, the
+            # available samples occupy the right side of the fixed 0–5 s view.
+            elapsed = n_time / float(ACC_SAMPLE_RATE_HZ)
+            start_time = max(0.0, self.TIME_WINDOW_SECONDS - elapsed)
+            time_axis = (
+                start_time + np.arange(n_time, dtype=np.float64) / ACC_SAMPLE_RATE_HZ
+            )
+
+            raw_arrays = (x_time, y_time, z_time)
+            for curve, values in zip(self.time_curves, raw_arrays):
+                curve.setData(
+                    time_axis,
+                    values,
+                    skipFiniteCheck=True
+                )
+
+            # FFT uses the most recent exact FFT_SIZE raw samples.
+            n_fft = min(
+                self.FFT_SIZE,
+                x.size,
+                y.size,
+                z.size
+            )
+
+            if n_fft >= 16:
+                fft_arrays = (x[-n_fft:], y[-n_fft:], z[-n_fft:])
+                for curve, values in zip(self.fft_curves, fft_arrays):
+                    freq, amplitude = self._one_sided_fft(values)
+                    if freq is not None:
+                        # Only display the requested 0–500 Hz FFT range.
+                        mask = freq <= self.MAX_FFT_FREQ_HZ
+                        curve.setData(
+                            freq[mask],
+                            amplitude[mask],
+                            skipFiniteCheck=True
+                        )
+
+                delta_f = ACC_SAMPLE_RATE_HZ / float(n_fft)
+                self.range_info.setText(
+                    f"Time: 0–{self.TIME_WINDOW_SECONDS:.2f} s | "
+                    f"FFT: {n_fft} samples | Fs: {ACC_SAMPLE_RATE_HZ} Hz | "
+                    f"Δf: {delta_f:.3f} Hz"
+                )
+
+            latest = (
+                float(x[-1]),
+                float(y[-1]),
+                float(z[-1])
+            )
+
+            self.live_info.setText(
+                f"RAW LIVE | X: {latest[0]:+.3f} g | "
+                f"Y: {latest[1]:+.3f} g | "
+                f"Z: {latest[2]:+.3f} g | "
+                f"Samples: {sample_count:,} | "
+                f"Packets: {packet_count:,} | "
+                f"CRC errors: {crc_errors:,}"
+            )
+
+        except Exception as exc:
+            self.live_info.setText(f"Vibration display error: {exc}")
+        finally:
+            self._updating = False
+
+    def go_back(self):
+        self.timer.stop()
+        self.hide()
+        if callable(self.back_callback):
+            self.back_callback()
+
+
 # ---------------------------------------------------------------------------
 # Main dashboard
 # ---------------------------------------------------------------------------
@@ -4574,6 +4924,7 @@ class Dashboard(QWidget):
         self._build_ui()
         self._create_click_targets()
         self._create_pages()
+        self._create_vibration_page()
 
         self.demo_timer = QTimer(self)
         self.demo_timer.timeout.connect(self._demo_data)
@@ -4729,7 +5080,7 @@ class Dashboard(QWidget):
     def _create_click_targets(self):
         # Live view navigation target.
         self.live_target = TransparentButton(self.background)
-        self.live_target.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+        self.live_target.clicked.connect(self.open_vibration_page)
 
         # Bottom DAQ controls.  The five template boxes are now: live view,
         # logging toggle, SD browser, SD download and TARE ALL.
@@ -4800,7 +5151,49 @@ class Dashboard(QWidget):
         self._set_bottom_button_style(self.sd_target, "gray")
         self._set_bottom_button_style(self.download_target, "gray")
 
-    # ---------------- Pages ----------------
+    # ---------------- Live vibration analysis page ----------------
+
+    def _create_vibration_page(self):
+        """Create the full-screen live vibration page once."""
+        self.vibration_page = VibrationAnalysisPage(
+            self.background,
+            back_callback=self.close_vibration_page
+        )
+        self.vibration_page.setGeometry(self.background.rect())
+        self.vibration_page.hide()
+        self.vibration_page.raise_()
+
+    def open_vibration_page(self):
+        """Open the six-plot live vibration page from LIVE VIEW."""
+        if not hasattr(self, "vibration_page"):
+            return
+        self.vibration_page.setGeometry(self.background.rect())
+        self.vibration_page.show()
+        self.vibration_page.raise_()
+        self.vibration_page.activateWindow()
+
+    def close_vibration_page(self):
+        """Return from the vibration page to the normal dashboard."""
+        if hasattr(self, "vibration_page"):
+            self.vibration_page.hide()
+        self.overlay.raise_()
+        for widget in (
+            self.connection_combo,
+            self.connect_btn,
+            self.start_btn,
+            self.stop_btn,
+            self.pages,
+            self.setup_btn,
+            self.exp_btn,
+            self.analysis_btn,
+            self.live_target,
+            self.daq_target,
+            self.log_target,
+            self.sd_target,
+            self.download_target,
+            self.tare_target,
+        ):
+            widget.raise_()
 
     def _create_pages(self):
         # Setup.
@@ -4894,6 +5287,9 @@ class Dashboard(QWidget):
         # application client area. All overlay coordinates are then mapped
         # against the same 1920x1080 reference.
         self.background.setGeometry(self.rect())
+
+        if hasattr(self, "vibration_page"):
+            self.vibration_page.setGeometry(self.background.rect())
 
         if self.overlay:
             self.overlay.setGeometry(
@@ -5035,6 +5431,11 @@ class Dashboard(QWidget):
             self.tare_target,
         ):
             widget.raise_()
+
+        # The vibration page is a full-screen overlay. If it is currently
+        # visible it must remain above the dashboard controls after resize.
+        if hasattr(self, "vibration_page") and self.vibration_page.isVisible():
+            self.vibration_page.raise_()
 
         event.accept()
 

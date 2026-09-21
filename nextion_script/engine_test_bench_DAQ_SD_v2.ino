@@ -25,6 +25,41 @@
 // ---------------------- USB / SERIAL -------------------
 #define SERIAL_BAUD                 921600
 
+// ---------------------- NEXTION DISPLAY -------------------
+// Dedicated hardware UART. Existing USB DAQ (Serial) remains unchanged.
+// Teensy 4.1 Serial6: RX=25, TX=24.
+#define NEXTION_BAUD                921600
+#define NEXTION_SERIAL              Serial6
+#define NEXTION_RX_PIN              25
+#define NEXTION_TX_PIN              24
+#define NEXTION_UPDATE_PERIOD_MS    100
+#define NEXTION_THROTTLE_READ_MS    100
+
+// Larger buffers are important at 921600 baud.
+static uint8_t nextionRxExtra[2048];
+static uint8_t nextionTxExtra[1024];
+
+// Exact component names from the supplied Python engine-model reference.
+#define NEXTION_RPM                 "rpm"
+#define NEXTION_THRUST              "thrust"
+#define NEXTION_FUEL                "fule"
+#define NEXTION_CHT                 "cht"
+#define NEXTION_EGT                 "eht"
+#define NEXTION_RPM_GAUGE           "rpmGauge"
+#define NEXTION_THRUST_GAUGE        "thrustGauge"
+#define NEXTION_FUEL_GAUGE          "fuleGauge"
+#define NEXTION_CHT_GAUGE           "chtGauge"
+#define NEXTION_EGT_GAUGE           "ehtGauge"
+#define NEXTION_THROTTLE_SLIDER     "throtleSlider"
+#define NEXTION_THROTTLE_TEXT       "throtle"
+#define NEXTION_VIB_X               "vibX"
+#define NEXTION_VIB_Y               "vibY"
+#define NEXTION_VIB_Z               "vibZ"
+#define NEXTION_RPM_WAVEFORM_ID     2
+#define NEXTION_VIB_X_WAVEFORM_ID   3
+#define NEXTION_VIB_Y_WAVEFORM_ID   4
+#define NEXTION_VIB_Z_WAVEFORM_ID   5
+
 // ---------------------- MAX31856 -----------------------
 #define MAX31856_1_CS               10
 #define MAX31856_2_CS               9
@@ -78,6 +113,8 @@
 #define TELEMETRY_SYNC_1            0xAA
 #define TELEMETRY_SYNC_2            0x55
 #define TELEMETRY_TYPE_ACCEL        0x01
+#define TELEMETRY_TYPE_STATUS       0x02
+#define TELEMETRY_STATUS_BYTES      2   // uint16 throttle percent x10
 
 // ---------------------- SD LOGGING --------------------
 #define SD_LOG_ENABLED_DEFAULT      true
@@ -225,6 +262,283 @@ uint8_t latestFault2 = 0;
 uint32_t lastSensorUpdateMs = 0;
 uint32_t lastDisplayMs = 0;
 
+// ======================================================
+// GLOBAL ENGINE / DISPLAY VALUES
+// ======================================================
+// One global throttle value is shared by Nextion and the laptop DAQ.
+// Nextion is the physical input; the laptop can also issue THROTTLE <0..100>.
+float throttlePercent = 0.0f;
+
+float latestVibrationX_g = 0.0f;
+float latestVibrationY_g = 0.0f;
+float latestVibrationZ_g = 0.0f;
+
+// The supplied firmware has no RPM or fuel-level sensor input yet.
+// Keep these explicit at zero rather than generating simulated values.
+float latestRPM = 0.0f;
+float latestFuelPercent = 0.0f;
+
+uint32_t lastNextionDisplayMs = 0;
+uint32_t lastNextionThrottleRequestMs = 0;
+int lastNextionThrottleSent = -1;
+
+
+// ======================================================
+// NEXTION DISPLAY - DIRECT TEENSY UART
+// ======================================================
+// Exact variable/component names are taken from the supplied Python engine
+// simulator. The ESP32 bridge is no longer needed for the display path.
+//
+// Nextion command terminator = FF FF FF
+// "get throtleSlider.val" returns:
+// 71 <4-byte little-endian uint32> FF FF FF
+// ======================================================
+
+static void nextionWriteTerminator()
+{
+  NEXTION_SERIAL.write((uint8_t)0xFF);
+  NEXTION_SERIAL.write((uint8_t)0xFF);
+  NEXTION_SERIAL.write((uint8_t)0xFF);
+}
+
+void nextionSendCommand(const char *command)
+{
+  if (!command)
+    return;
+
+  NEXTION_SERIAL.print(command);
+  nextionWriteTerminator();
+}
+
+void nextionSetNumeric(const char *component, long value)
+{
+  if (!component)
+    return;
+
+  char command[64];
+  snprintf(command, sizeof(command), "%s.val=%ld", component, value);
+  nextionSendCommand(command);
+}
+
+void nextionSetText(const char *component, const char *text)
+{
+  if (!component || !text)
+    return;
+
+  char command[96];
+  snprintf(command, sizeof(command), "%s.txt=\"%s\"", component, text);
+  nextionSendCommand(command);
+}
+
+static long nextionScale(float value, float inMin, float inMax,
+                         long outMin, long outMax)
+{
+  if (inMax <= inMin)
+    return outMin;
+
+  value = constrain(value, inMin, inMax);
+  float ratio = (value - inMin) / (inMax - inMin);
+  return (long)lroundf(outMin + ratio * (float)(outMax - outMin));
+}
+
+void nextionSetThrottleSlider(float percent)
+{
+  percent = constrain(percent, 0.0f, 100.0f);
+  int value = (int)lroundf(percent);
+
+  // Only write when the value actually changed, so the operator can touch
+  // the slider without the MCU continuously fighting the touch input.
+  if (lastNextionThrottleSent != value)
+  {
+    nextionSetNumeric(NEXTION_THROTTLE_SLIDER, value);
+
+    char text[16];
+    snprintf(text, sizeof(text), "%d%%", value);
+    nextionSetText(NEXTION_THROTTLE_TEXT, text);
+
+    lastNextionThrottleSent = value;
+  }
+}
+
+void nextionRequestThrottle()
+{
+  nextionSendCommand("get throtleSlider.val");
+}
+
+void nextionProcessRx()
+{
+  static uint8_t buffer[8];
+  static uint8_t count = 0;
+
+  while (NEXTION_SERIAL.available())
+  {
+    uint8_t c = (uint8_t)NEXTION_SERIAL.read();
+
+    if (count == 0)
+    {
+      if (c == 0x71)
+        buffer[count++] = c;
+      continue;
+    }
+
+    buffer[count++] = c;
+
+    if (count == 8)
+    {
+      if (buffer[0] == 0x71 &&
+          buffer[5] == 0xFF &&
+          buffer[6] == 0xFF &&
+          buffer[7] == 0xFF)
+      {
+        uint32_t value =
+            ((uint32_t)buffer[1]) |
+            ((uint32_t)buffer[2] << 8) |
+            ((uint32_t)buffer[3] << 16) |
+            ((uint32_t)buffer[4] << 24);
+
+        throttlePercent = constrain((float)value, 0.0f, 100.0f);
+      }
+
+      count = 0;
+    }
+  }
+}
+
+// Forward declarations required because telemetry declarations are defined later.
+extern bool telemetryEnabled;
+uint16_t crc16_ccitt(const uint8_t *data, uint16_t length);
+
+void sendThrottleStatusTelemetry()
+{
+  if (!telemetryEnabled)
+    return;
+
+  // Type 0x02. Payload = uint16 throttle percent x10.
+  uint16_t throttle10 =
+      (uint16_t)constrain(lroundf(throttlePercent * 10.0f), 0L, 1000L);
+
+  // CRC must cover exactly the same bytes as the Python decoder:
+  // TYPE + COUNT_L + COUNT_H + PAYLOAD.
+  uint8_t crcData[5];
+  crcData[0] = TELEMETRY_TYPE_STATUS;
+  crcData[1] = TELEMETRY_STATUS_BYTES & 0xFF;
+  crcData[2] = TELEMETRY_STATUS_BYTES >> 8;
+  crcData[3] = throttle10 & 0xFF;
+  crcData[4] = throttle10 >> 8;
+
+  uint16_t crc = crc16_ccitt(crcData, sizeof(crcData));
+
+  uint8_t header[5] = {
+    TELEMETRY_SYNC_1,
+    TELEMETRY_SYNC_2,
+    TELEMETRY_TYPE_STATUS,
+    TELEMETRY_STATUS_BYTES & 0xFF,
+    TELEMETRY_STATUS_BYTES >> 8
+  };
+
+  uint8_t crcBytes[2] = {
+    (uint8_t)(crc & 0xFF),
+    (uint8_t)(crc >> 8)
+  };
+
+  Serial.write(header, sizeof(header));
+  Serial.write(&crcData[3], TELEMETRY_STATUS_BYTES);
+  Serial.write(crcBytes, sizeof(crcBytes));
+}
+
+void nextionUpdateDisplay()
+{
+  // Real sensors available in the current firmware:
+  // load cell #1 -> thrust, MAX31856 #1/#2 -> EGT/CHT,
+  // ADXL335 -> vibration. No simulated engine values are used.
+  float thrustKg = max(0.0f, latestWeight1 / 1000.0f);
+  float egt = isnan(latestTemp1) ? 0.0f : latestTemp1;
+  float cht = isnan(latestTemp2) ? 0.0f : latestTemp2;
+
+  // Exact numeric component names/scaling from the reference simulator.
+  nextionSetNumeric(NEXTION_RPM, (long)lroundf(latestRPM));
+  nextionSetNumeric(NEXTION_THRUST, (long)lroundf(thrustKg * 100.0f));
+  nextionSetNumeric(NEXTION_FUEL, (long)lroundf(latestFuelPercent));
+  nextionSetNumeric(NEXTION_CHT, (long)lroundf(cht));
+  nextionSetNumeric(NEXTION_EGT, (long)lroundf(egt));
+
+  // Exact gauge ranges from the reference simulator.
+  nextionSetNumeric(NEXTION_RPM_GAUGE,
+                    nextionScale(latestRPM, 0.0f, 8000.0f, 0, 270));
+  nextionSetNumeric(NEXTION_THRUST_GAUGE,
+                    nextionScale(thrustKg, 0.0f, 7.0f, 0, 245));
+  nextionSetNumeric(NEXTION_FUEL_GAUGE,
+                    nextionScale(latestFuelPercent, 0.0f, 100.0f, 0, 245));
+  nextionSetNumeric(NEXTION_CHT_GAUGE,
+                    nextionScale(cht, 0.0f, 250.0f, 0, 245));
+  nextionSetNumeric(NEXTION_EGT_GAUGE,
+                    nextionScale(egt, 0.0f, 800.0f, 0, 245));
+
+  // Vibration values are in hundredths of g because Nextion .val is integer.
+  nextionSetNumeric(NEXTION_VIB_X,
+                    (long)lroundf(latestVibrationX_g * 100.0f));
+  nextionSetNumeric(NEXTION_VIB_Y,
+                    (long)lroundf(latestVibrationY_g * 100.0f));
+  nextionSetNumeric(NEXTION_VIB_Z,
+                    (long)lroundf(latestVibrationZ_g * 100.0f));
+
+  // Global throttle synchronization.
+  nextionSetThrottleSlider(throttlePercent);
+
+  // Waveforms use the exact object IDs from the reference code.
+  uint8_t rp = (uint8_t)nextionScale(latestRPM, 0.0f, 8000.0f, 0, 255);
+  uint8_t vx = (uint8_t)nextionScale(latestVibrationX_g, -60.0f, 60.0f, 0, 255);
+  uint8_t vy = (uint8_t)nextionScale(latestVibrationY_g, -60.0f, 60.0f, 0, 255);
+  uint8_t vz = (uint8_t)nextionScale(latestVibrationZ_g, -60.0f, 60.0f, 0, 255);
+
+  char command[48];
+  snprintf(command, sizeof(command), "add %d,0,%u", NEXTION_RPM_WAVEFORM_ID, rp);
+  nextionSendCommand(command);
+  snprintf(command, sizeof(command), "add %d,0,%u", NEXTION_VIB_X_WAVEFORM_ID, vx);
+  nextionSendCommand(command);
+  snprintf(command, sizeof(command), "add %d,0,%u", NEXTION_VIB_Y_WAVEFORM_ID, vy);
+  nextionSendCommand(command);
+  snprintf(command, sizeof(command), "add %d,0,%u", NEXTION_VIB_Z_WAVEFORM_ID, vz);
+  nextionSendCommand(command);
+
+  // Laptop receives the same global throttle value.
+  sendThrottleStatusTelemetry();
+}
+
+void nextionBegin()
+{
+  NEXTION_SERIAL.addMemoryForRead(nextionRxExtra, sizeof(nextionRxExtra));
+  NEXTION_SERIAL.addMemoryForWrite(nextionTxExtra, sizeof(nextionTxExtra));
+  NEXTION_SERIAL.begin(NEXTION_BAUD, SERIAL_8N1);
+  delay(50);
+
+  while (NEXTION_SERIAL.available())
+    NEXTION_SERIAL.read();
+
+  nextionSetThrottleSlider(throttlePercent);
+
+  Serial.println("NEXTION: Serial6 RX=25 TX=24 @ 921600");
+}
+
+void serviceNextion()
+{
+  nextionProcessRx();
+
+  uint32_t now = millis();
+
+  if ((uint32_t)(now - lastNextionThrottleRequestMs) >= NEXTION_THROTTLE_READ_MS)
+  {
+    lastNextionThrottleRequestMs = now;
+    nextionRequestThrottle();
+  }
+
+  if ((uint32_t)(now - lastNextionDisplayMs) >= NEXTION_UPDATE_PERIOD_MS)
+  {
+    lastNextionDisplayMs = now;
+    nextionUpdateDisplay();
+  }
+}
+
 
 // ======================================================
 // SERIAL COMMAND
@@ -316,6 +630,17 @@ static void sendSDDataFrame(uint32_t offset, const uint8_t *data, uint16_t lengt
 static bool waitForSDDownloadAck(uint32_t expectedOffset, uint32_t timeoutMs = 1000);
 
 void performADXLCalibration();
+
+void nextionBegin();
+void nextionProcessRx();
+void nextionRequestThrottle();
+void nextionUpdateDisplay();
+void nextionSendCommand(const char *command);
+void nextionSetNumeric(const char *component, long value);
+void nextionSetText(const char *component, const char *text);
+void nextionSetThrottleSlider(float percent);
+void sendThrottleStatusTelemetry();
+void serviceNextion();
 
 float rawToVoltage(uint16_t raw);
 float rawToG(uint16_t raw, float offset, float sensitivity);
@@ -632,6 +957,7 @@ void performADXLCalibration()
 
 calibration_end:
 
+  configureVibrationFilter();
   clearAccelerationBuffer();
   startAccelerationSampling();
 
@@ -991,6 +1317,12 @@ void processAccelerationBuffer()
         outputSample,
         totalSampleIndex,
         timestampUs);
+
+    // Convert the exact sample sent to USB/SD into calibrated g.
+    latestVibrationX_g = rawToG(outputSample.x, adxlXOffset, adxlXSensitivity);
+    latestVibrationY_g = rawToG(outputSample.y, adxlYOffset, adxlYSensitivity);
+    latestVibrationZ_g = rawToG(outputSample.z, adxlZOffset, adxlZSensitivity);
+
     totalSampleIndex++;
     processed++;
   }
@@ -1851,6 +2183,32 @@ void handleSerialCommand()
       }
 
       // ==================================================
+      // GLOBAL THROTTLE
+      // ==================================================
+      // Example: THROTTLE 42.5
+      // ==================================================
+
+      else if (commandUpper.startsWith("THROTTLE "))
+      {
+        int spaceIndex = serialCommand.indexOf(' ');
+
+        if (spaceIndex > 0)
+        {
+          float value = serialCommand.substring(spaceIndex + 1).toFloat();
+          throttlePercent = constrain(value, 0.0f, 100.0f);
+          nextionSetThrottleSlider(throttlePercent);
+
+          Serial.print("THROTTLE GLOBAL = ");
+          Serial.print(throttlePercent, 1);
+          Serial.println(" %");
+        }
+        else
+        {
+          Serial.println("ERROR: THROTTLE requires 0..100");
+        }
+      }
+
+      // ==================================================
       // LOGSTART / STARTLOG
       // ==================================================
 
@@ -2036,6 +2394,7 @@ void handleSerialCommand()
         Serial.println("SD_DOWNLOAD filename.bin");
         Serial.println("TELEMETRY ON");
         Serial.println("TELEMETRY OFF");
+        Serial.println("THROTTLE 0..100");
         Serial.println("STATUS");
         Serial.println();
       }
@@ -2058,6 +2417,10 @@ void handleSerialCommand()
 void setup()
 {
   Serial.begin(SERIAL_BAUD);
+
+  // USB Serial remains the laptop DAQ connection.
+  // Nextion uses the separate Serial6 UART.
+  nextionBegin();
 
   delay(1500);
 
@@ -2313,6 +2676,11 @@ void setup()
   // START 2 kHz ACCELERATION
   // ====================================================
 
+  // IMPORTANT: initialize Butterworth coefficients before the first sample.
+  // Without this call the filter coefficients remain zero and vibration output
+  // collapses to zero even though the ADC itself is reading correctly.
+  configureVibrationFilter();
+
   clearAccelerationBuffer();
   startAccelerationSampling();
 
@@ -2343,4 +2711,7 @@ void loop()
 
   // 4. Human-readable monitor output
   displaySlowSensors();
+
+  // 5. Nextion display + global throttle synchronization
+  serviceNextion();
 }
