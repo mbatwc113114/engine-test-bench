@@ -313,6 +313,7 @@ static void handleSDInitCommand();
 static void handleSDListCommand();
 static bool handleSDDownloadCommand(const char *requestedName);
 static void sendSDDataFrame(uint32_t offset, const uint8_t *data, uint16_t length, uint16_t &fileCRC);
+static bool waitForSDDownloadAck(uint32_t expectedOffset, uint32_t timeoutMs = 1000);
 
 void performADXLCalibration();
 
@@ -1491,6 +1492,63 @@ uint16_t crc16_update(uint16_t crc,
 
 
 // ======================================================
+// SD DOWNLOAD HOST ACK
+// ======================================================
+// The PC acknowledges every completed data frame with:
+//   SD_ACK <next byte offset>
+// This makes the transfer stop-and-wait and prevents USB CDC
+// buffering overruns on large files.
+// ======================================================
+
+static bool waitForSDDownloadAck(uint32_t expectedOffset, uint32_t timeoutMs)
+{
+  String ack = "";
+  uint32_t start = millis();
+
+  while ((uint32_t)(millis() - start) < timeoutMs)
+  {
+    while (Serial.available() > 0)
+    {
+      char c = (char)Serial.read();
+
+      if (c == '\n')
+      {
+        ack.trim();
+
+        if (ack.startsWith("SD_ACK "))
+        {
+          String value = ack.substring(7);
+          value.trim();
+
+          char *endPtr = nullptr;
+          unsigned long parsed = strtoul(value.c_str(), &endPtr, 10);
+
+          if (endPtr != value.c_str() && *endPtr == '\0' &&
+              (uint32_t)parsed == expectedOffset)
+          {
+            return true;
+          }
+        }
+
+        ack = "";
+      }
+      else if (c != '\r')
+      {
+        if (ack.length() < 48)
+          ack += c;
+        else
+          ack = "";
+      }
+    }
+
+    delayMicroseconds(100);
+  }
+
+  return false;
+}
+
+
+// ======================================================
 // SD FILE DOWNLOAD
 // ======================================================
 
@@ -1574,13 +1632,44 @@ static bool handleSDDownloadCommand(const char *requestedName)
     header[1] = SD_TRANSFER_SYNC_2;
     memcpy(&header[2], frameBody, sizeof(frameBody));
 
-    Serial.write(header, sizeof(header));
-    Serial.write(buffer, length);
-
     uint8_t crcBytes[2];
     crcBytes[0] = frameCRC & 0xFF;
     crcBytes[1] = frameCRC >> 8;
-    Serial.write(crcBytes, sizeof(crcBytes));
+
+    bool acknowledged = false;
+
+    // Send the frame and wait for the PC to acknowledge the next offset.
+    // Retry a few times if the ACK is lost/corrupted.
+    for (uint8_t attempt = 0; attempt < 4 && !acknowledged; attempt++)
+    {
+      if (attempt > 0)
+      {
+        // Briefly yield before retransmitting the exact same frame.
+        delay(2);
+      }
+
+      Serial.write(header, sizeof(header));
+      Serial.write(buffer, length);
+      Serial.write(crcBytes, sizeof(crcBytes));
+      Serial.flush();
+
+      acknowledged = waitForSDDownloadAck(offset + length, 1200);
+    }
+
+    if (!acknowledged)
+    {
+      Serial.print("SD_DOWNLOAD_ERROR ACK_TIMEOUT ");
+      Serial.println(offset);
+      file.close();
+
+      telemetryEnabled = wasTelemetry;
+      if (wasSampling)
+      {
+        clearAccelerationBuffer();
+        startAccelerationSampling();
+      }
+      return false;
+    }
 
     offset += length;
   }
@@ -2209,6 +2298,8 @@ void setup()
       "SD_LIST             -> List .bin files on SD");
   Serial.println(
       "SD_DOWNLOAD file    -> Download binary file");
+  Serial.println(
+      "SD_ACK offset       -> PC-only download acknowledgement");
   Serial.println(
       "TELEMETRY ON        -> Binary USB telemetry");
   Serial.println(

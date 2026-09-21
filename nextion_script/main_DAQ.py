@@ -558,15 +558,12 @@ def handle_sd_download_frame(frame):
     received_crc = int.from_bytes(frame[-2:], "little")
     calculated_crc = crc16_ccitt(frame[2:-2])
     if received_crc != calculated_crc:
+        # Do not abort immediately. The Teensy uses stop-and-wait transfer and
+        # will retransmit this frame when it does not receive our ACK.
         with download_lock:
-            download_error = f"SD transfer CRC error at offset {offset:,}."
-            download_active = False
-            if download_file_handle is not None:
-                try:
-                    download_file_handle.close()
-                except Exception:
-                    pass
-                download_file_handle = None
+            download_last_status = (
+                f"CRC error at offset {offset:,}; waiting for Teensy retry..."
+            )
         return False
 
     with download_lock:
@@ -574,10 +571,28 @@ def handle_sd_download_frame(frame):
             download_error = "Unexpected SD data frame."
             return False
         if offset != download_received_size:
+            # If the Teensy did not receive our previous ACK, it retransmits
+            # the immediately preceding frame. It is already present on disk;
+            # ACK it again instead of falsely reporting an offset error.
+            if (offset < download_received_size and
+                    offset + payload_len == download_received_size):
+                download_last_status = (
+                    f"Re-ACKing frame at {offset:,}; "
+                    f"{download_received_size:,} bytes already received."
+                )
+                return True
+
             download_error = (
                 f"SD transfer offset error: got {offset}, "
                 f"expected {download_received_size}."
             )
+            download_active = False
+            if download_file_handle is not None:
+                try:
+                    download_file_handle.close()
+                except Exception:
+                    pass
+                download_file_handle = None
             return False
         try:
             download_file_handle.write(payload)
@@ -596,6 +611,15 @@ def handle_sd_download_frame(frame):
             download_error = f"PC file write error: {exc}"
             return False
     return True
+
+
+def send_sd_download_ack(next_offset):
+    """Acknowledge the next byte offset so the Teensy can send the next frame.
+
+    SD transfer is intentionally stop-and-wait. This prevents the Teensy USB
+    serial stream from overrunning the PC/pyserial buffers on large files.
+    """
+    return send_teensy_command(f"SD_ACK {int(next_offset)}")
 
 
 # ============================================================
@@ -662,7 +686,11 @@ def serial_reader():
                             break
                         frame = bytes(rx[:frame_size])
                         del rx[:frame_size]
-                        handle_sd_download_frame(frame)
+                        frame_ok = handle_sd_download_frame(frame)
+                        if frame_ok:
+                            with download_lock:
+                                ack_offset = download_received_size
+                            send_sd_download_ack(ack_offset)
                         continue
 
                     # End/error lines after the final binary frame.
@@ -723,7 +751,11 @@ def serial_reader():
                         break
                     frame = bytes(rx[:frame_size])
                     del rx[:frame_size]
-                    handle_sd_download_frame(frame)
+                    frame_ok = handle_sd_download_frame(frame)
+                    if frame_ok:
+                        with download_lock:
+                            ack_offset = download_received_size
+                        send_sd_download_ack(ack_offset)
                     continue
 
                 # AA55 acceleration packet.
@@ -4699,36 +4731,74 @@ class Dashboard(QWidget):
         self.live_target = TransparentButton(self.background)
         self.live_target.clicked.connect(lambda: self.pages.setCurrentIndex(0))
 
-        # The five template boxes at the bottom are now real DAQ controls.
-        # Existing DAQ/servo navigation remains available while the empty
-        # boxes gain the requested logging/SD workflow.
+        # Bottom DAQ controls.  The five template boxes are now: live view,
+        # logging toggle, SD browser, SD download and TARE ALL.
         self.daq_target = QPushButton("LIVE / DAQ", self.background)
         self.log_target = QPushButton("START LOG", self.background)
         self.sd_target = QPushButton("SD FILES", self.background)
-        self.servo_target = QPushButton("DOWNLOAD", self.background)
-        self.sensor_target = QPushButton("SERVO", self.background)
+        self.download_target = QPushButton("DOWNLOAD", self.background)
+        self.tare_target = QPushButton("TARE ALL", self.background)
 
-        bottom_style = """
-            QPushButton {
-                background: #555555;
-                color: #ffffff;
-                border: 1px solid #666666;
-                border-radius: 10px;
-                font-size: 15px;
-                font-weight: bold;
-            }
-            QPushButton:hover { background: #686868; }
-            QPushButton:pressed { background: #404040; }
-        """
-        for b in (self.daq_target, self.log_target, self.sd_target,
-                  self.servo_target, self.sensor_target):
-            b.setStyleSheet(bottom_style)
+        self._update_bottom_button_states()
 
         self.daq_target.clicked.connect(lambda: self.pages.setCurrentIndex(0))
         self.log_target.clicked.connect(self.start_log_toggle)
         self.sd_target.clicked.connect(lambda: self.open_sd_dialog(False))
-        self.servo_target.clicked.connect(lambda: self.open_sd_dialog(True))
-        self.sensor_target.clicked.connect(self._show_servo_message)
+        self.download_target.clicked.connect(lambda: self.open_sd_dialog(True))
+        self.tare_target.clicked.connect(self._tare_all)
+
+    def _set_bottom_button_style(self, button, state="gray"):
+        colors = {
+            "gray": ("#555555", "#686868"),
+            "green": ("#1f9d45", "#27b957"),
+            "red": ("#c52f3d", "#e04050"),
+        }
+        bg, hover = colors.get(state, colors["gray"])
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background: {bg};
+                color: #ffffff;
+                border: 1px solid #777777;
+                border-radius: 10px;
+                font-size: 15px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{ background: {hover}; }}
+            QPushButton:pressed {{ background: #404040; }}
+            QPushButton:disabled {{
+                background: #3b3b3b; color: #8a8a8a;
+                border: 1px solid #4b4b4b;
+            }}
+        """)
+
+    def _update_bottom_button_states(self):
+        connected = bool(serial_connected) and self.connection_combo.currentText() == "USB / Serial"
+
+        if not connected:
+            self.log_target.setText("START LOG")
+            self._set_bottom_button_style(self.log_target, "gray")
+            self._set_bottom_button_style(self.tare_target, "gray")
+            self.sd_target.setEnabled(False)
+            self.download_target.setEnabled(False)
+            self.tare_target.setEnabled(False)
+            return
+
+        self.sd_target.setEnabled(not logging_active)
+        self.download_target.setEnabled(not logging_active)
+        self.tare_target.setEnabled(not logging_active)
+
+        if logging_active:
+            self.log_target.setText("STOP LOG")
+            self._set_bottom_button_style(self.log_target, "red")
+            self._set_bottom_button_style(self.tare_target, "gray")
+        else:
+            self.log_target.setText("START LOG")
+            self._set_bottom_button_style(self.log_target, "green")
+            self._set_bottom_button_style(self.tare_target, "green")
+
+        self._set_bottom_button_style(self.daq_target, "gray")
+        self._set_bottom_button_style(self.sd_target, "gray")
+        self._set_bottom_button_style(self.download_target, "gray")
 
     # ---------------- Pages ----------------
 
@@ -4929,7 +4999,7 @@ class Dashboard(QWidget):
             )
         )
 
-        self.servo_target.setGeometry(
+        self.download_target.setGeometry(
             *scale_rect(
                 (634, 938, 175, 91),
                 self.width(),
@@ -4937,7 +5007,7 @@ class Dashboard(QWidget):
             )
         )
 
-        self.sensor_target.setGeometry(
+        self.tare_target.setGeometry(
             *scale_rect(
                 (826, 938, 175, 91),
                 self.width(),
@@ -4961,8 +5031,8 @@ class Dashboard(QWidget):
             self.daq_target,
             self.log_target,
             self.sd_target,
-            self.servo_target,
-            self.sensor_target,
+            self.download_target,
+            self.tare_target,
         ):
             widget.raise_()
 
@@ -5358,7 +5428,7 @@ class Dashboard(QWidget):
                 self.connected = False
                 self.overlay.connected = False
                 self._set_connection_state("ERROR", False)
-        self.log_target.setText("STOP LOG" if logging_active else "START LOG")
+        self._update_bottom_button_states()
 
 
     def disconnect_udp(self):
@@ -5735,15 +5805,38 @@ class Dashboard(QWidget):
 
         dialog.exec_()
 
-    def _show_servo_message(self):
-        QMessageBox.information(
-            self,
-            "Throttle Servo",
-            "Servo control is ready.\n\n"
-            "Throttle / thrust command output uses ESP32 GPIO 9.\n"
-            "The Experiment tab sends the generated throttle profile "
-            "to the ESP32 over UDP."
+    def _tare_all(self):
+        if self.connection_combo.currentText() != "USB / Serial":
+            QMessageBox.information(
+                self, "TARE ALL",
+                "Select USB / Serial and connect the Teensy first."
+            )
+            return
+        if not serial_connected:
+            QMessageBox.warning(self, "TARE ALL", "Teensy USB/Serial is not connected.")
+            return
+        if logging_active:
+            QMessageBox.warning(
+                self, "TARE ALL",
+                "Stop SD logging before taring the load cells."
+            )
+            return
+
+        reply = QMessageBox.question(
+            self, "TARE ALL",
+            "Remove all load from both load cells.\n\n"
+            "This will tare both HX711 channels. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
         )
+        if reply != QMessageBox.Yes:
+            return
+
+        ok, msg = send_teensy_command("TAREALL")
+        if not ok:
+            QMessageBox.warning(self, "TARE ALL", msg)
+        else:
+            self.teensy_text_log_message = msg
 
     # ---------------- Close ----------------
 
