@@ -88,14 +88,18 @@ void udpLoop() {
 
   if (strcmp(type, "STOP") == 0 || strcmp(type, "DAQ_STOP") == 0) {
     setThrottlePercent(0.0f);
-    sendToTeensy("STOP");
-    udpSendJson("{\"type\":\"ACK\",\"command\":\"STOP\",\"state\":\"STOPPED\"}");
+    Serial.println("[ESP32] Command decoded: STOP");
+    if (!sendToTeensy("STOP")) {
+      udpSendJson("{\"type\":\"ERROR\",\"command\":\"STOP\",\"error\":\"TEENSY_UART_TX_FAILED\"}");
+    }
     return;
   }
 
   if (strcmp(stateKey, "START") == 0 || strcmp(type, "START") == 0 || strcmp(type, "DAQ_START") == 0) {
-    sendToTeensy("DAQ_START");
-    udpSendJson("{\"type\":\"ACK\",\"command\":\"DAQ_START\",\"state\":\"RUNNING\"}");
+    Serial.println("[ESP32] Command decoded: DAQ_START");
+    if (!sendToTeensy("DAQ_START")) {
+      udpSendJson("{\"type\":\"ERROR\",\"command\":\"DAQ_START\",\"error\":\"TEENSY_UART_TX_FAILED\"}");
+    }
     return;
   }
 

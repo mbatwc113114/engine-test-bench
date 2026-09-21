@@ -711,6 +711,7 @@ class Dashboard(QWidget):
         self.esp32_ip = None
         self.udp_socket = None
         self.connection_state = "OFFLINE"
+        # These are request-in-flight flags, never permanent per-connection latches.
         self.start_sequence_sent = False
 
         self.udp_thread = None
@@ -1145,7 +1146,15 @@ class Dashboard(QWidget):
         self.overlay.system_ready = False
 
     def _set_connection_state(self, state, ready=None):
+        prev_state = getattr(self, "connection_state", None)
+        prev_ready = getattr(self, "_connection_ready", None)
+        next_ready = None if ready is None else bool(ready)
+
+        if prev_state == state and prev_ready == next_ready:
+            return
+
         self.connection_state = state
+        self._connection_ready = next_ready
         print(f"[DAQ] connection state -> {state}")
         if ready is not None:
             self.overlay.system_ready = bool(ready)
@@ -1155,6 +1164,8 @@ class Dashboard(QWidget):
             "CONNECTING": "#f0ad4e",
             "READY": "#21a842",
             "CONFIGURING": "#1769ff",
+            "STARTING": "#f0ad4e",
+            "STOPPING": "#f0ad4e",
             "EXPERIMENT": "#1769ff",
             "ERROR": "#c92a3a",
             "STOPPED": "#c92a3a",
@@ -1200,8 +1211,11 @@ class Dashboard(QWidget):
         elif state_text in ("CONFIG_RECEIVED", "CONFIGURING", "CONFIG_UPLOAD"):
             self._set_connection_state("CONFIGURING", False)
         elif state_text in ("RUNNING", "EXPERIMENT_RUNNING"):
+            self.start_sequence_sent = False
             self._set_connection_state("EXPERIMENT", True)
         elif state_text in ("STOPPED", "ERROR"):
+            if state_text == "STOPPED":
+                self.start_sequence_sent = False
             self._set_connection_state(state_text, False)
         elif state_text in ("DISCONNECTED", "OFFLINE"):
             self._set_connection_state("OFFLINE", False)
@@ -1220,6 +1234,7 @@ class Dashboard(QWidget):
 
     def on_udp_error(self, message):
         print(f"[DAQ] UDP error: {message}")
+        self.start_sequence_sent = False
         self._zero_live_data()
         self._set_connection_state("ERROR", False)
 
@@ -1266,22 +1281,37 @@ class Dashboard(QWidget):
         if not self.connected:
             print("[DAQ] START ignored: not connected")
             return
+        if self.connection_state in ("STARTING", "EXPERIMENT", "STOPPING"):
+            print(f"[DAQ] START ignored: DAQ state is {self.connection_state}")
+            return
         if self.start_sequence_sent:
-            print("[DAQ] DAQ_START already sent for this connection")
+            print("[DAQ] DAQ_START acknowledgement pending")
             return
         self.start_sequence_sent = True
-        print("[DAQ] sending DAQ_START to ESP32")
-        self.send_udp({"type": "DAQ_START", "command": "DAQ_START"})
+        payload = {"type": "DAQ_START"}
+        print("[DAQ] START button pressed")
+        ok = self.send_udp(payload)
+        if not ok:
+            self.start_sequence_sent = False
+            print("[DAQ] DAQ_START send failed")
+            return
         self.last_data_time = time.monotonic()
-        self._set_connection_state("READY", True)
+        self._set_connection_state("STARTING", False)
 
     def stop_udp_session(self):
         if not self.connected:
             print("[DAQ] STOP ignored: not connected")
             return
-        print("[DAQ] sending STOP to ESP32")
-        self.send_udp({"type": "DAQ_STOP", "command": "STOP"})
-        self._set_connection_state("STOPPED", False)
+        if self.connection_state == "STOPPING":
+            print("[DAQ] STOP acknowledgement pending")
+            return
+        payload = {"type": "STOP"}
+        print("[DAQ] STOP button pressed")
+        ok = self.send_udp(payload)
+        if not ok:
+            print("[DAQ] STOP send failed")
+            return
+        self._set_connection_state("STOPPING", False)
 
     def _try_direct_esp32_connect(self):
         """Fallback path used when mDNS discovery is unavailable or blocked."""
@@ -1362,9 +1392,6 @@ class Dashboard(QWidget):
         self.last_data_time = time.monotonic()
         self._set_connection_state("CONNECTED", True)
 
-        # After a real socket is established, trigger the DAQ start sequence.
-        # Without this, the ESP32 stays in READY/IDLE and never sends telemetry.
-        QTimer.singleShot(300, self.start_udp_session)
 
     def disconnect_udp(self):
         print("[DAQ] disconnect_udp() called")
@@ -1497,14 +1524,16 @@ class Dashboard(QWidget):
         return
 
     def _check_data_timeout(self):
-        if not getattr(self, "connected", False):
+        if (not getattr(self, "connected", False)
+                or self.connection_state not in ("STARTING", "EXPERIMENT")):
             return
         if self.last_data_time is None:
             return
-        if time.time() - self.last_data_time > HEARTBEAT_TIMEOUT_S:
+        if time.monotonic() - self.last_data_time > HEARTBEAT_TIMEOUT_S:
             print(f"[DAQ] telemetry timeout: no packet for {HEARTBEAT_TIMEOUT_S}s (socket still connected, waiting for Teensy telemetry)")
+            self.start_sequence_sent = False
             self.overlay.system_ready = False
-            self._set_connection_state("READY", False)
+            self._set_connection_state("ERROR", False)
 
     # ---------------- Config / experiment ----------------
 

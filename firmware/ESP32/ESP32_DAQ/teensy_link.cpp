@@ -7,6 +7,32 @@
 bool gTeensyAlive = false;
 String gTeensyRxBuffer;
 
+static bool appendLineFromStream(Stream& port, String& buffer, String& completedLine) {
+  while (port.available()) {
+    char c = static_cast<char>(port.read());
+    if (c == '\n' || c == '\r') {
+      if (buffer.length() > 0) {
+        completedLine = buffer;
+        buffer = "";
+        return true;
+      }
+      continue;
+    }
+
+    if (buffer.length() >= 256) {
+      buffer = "";
+#if DEBUG_MODE
+      Serial.println("[ESP32] Teensy UART buffer overflow");
+#endif
+      break;
+    }
+
+    buffer += c;
+  }
+
+  return false;
+}
+
 static void forwardTeensyTelemetry(const TeensyTelemetryData& data) {
   StaticJsonDocument<512> doc;
   JsonObject telemetry = doc.createNestedObject("data");
@@ -37,6 +63,39 @@ static void forwardTeensyTelemetry(const TeensyTelemetryData& data) {
   nextionSetValue("vibz", data.vibZ);
 }
 
+static void forwardTeensyResponse(const String& message) {
+  StaticJsonDocument<384> doc;
+  const bool isError = message.startsWith("ERROR|");
+  doc["type"] = isError ? "ERROR" : "ACK";
+  doc["source"] = "teensy";
+
+  int pos = message.indexOf('|') + 1;
+  while (pos > 0 && pos < message.length()) {
+    const int nextSep = message.indexOf('|', pos);
+    const String token = (nextSep >= 0) ? message.substring(pos, nextSep) : message.substring(pos);
+    const int equals = token.indexOf('=');
+    if (equals > 0) {
+      String key = token.substring(0, equals);
+      String value = token.substring(equals + 1);
+      key.trim();
+      value.trim();
+      if (key == "id") {
+        doc["id"] = value.toInt();
+      } else if (key == "command" || key == "status" || key == "state" || key == "error") {
+        doc[key.c_str()] = value;
+      }
+    }
+    if (nextSep < 0) {
+      break;
+    }
+    pos = nextSep + 1;
+  }
+
+  char jsonBuffer[384];
+  serializeJson(doc, jsonBuffer, sizeof(jsonBuffer));
+  udpSendJson(jsonBuffer);
+}
+
 bool sendToTeensy(const String& message) {
   if (message.length() == 0) {
     return false;
@@ -44,20 +103,17 @@ bool sendToTeensy(const String& message) {
 
   Serial1.print(message);
   Serial1.print('\n');
+#if DEBUG_MODE
+  Serial.print("[ESP32] Teensy TX: ");
+  Serial.println(message);
+#endif
   return true;
 }
 
 String receiveFromTeensy() {
   String value;
-  while (Serial1.available()) {
-    char c = static_cast<char>(Serial1.read());
-    if (c == '\n' || c == '\r') {
-      if (value.length() > 0) {
-        return value;
-      }
-      continue;
-    }
-    value += c;
+  if (appendLineFromStream(Serial1, gTeensyRxBuffer, value)) {
+    return value;
   }
   return "";
 }
@@ -141,7 +197,8 @@ void teensyLinkLoop() {
   Serial.println(msg);
 #endif
 
-  if (msg.startsWith("ACK") || msg.startsWith("ERROR") || msg.startsWith("STATUS") || msg.startsWith("PING")) {
+  if (msg.startsWith("ACK|") || msg.startsWith("ERROR|")) {
+    forwardTeensyResponse(msg);
     return;
   }
 

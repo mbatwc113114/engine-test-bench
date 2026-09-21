@@ -310,6 +310,8 @@ class ESP32UDPConnection(QObject):
                 separators=(",", ":")
             ).encode("utf-8")
 
+            print(f"[DAQ] UDP TX: {payload.decode('utf-8')}")
+
             with self.lock:
 
                 self.socket.sendto(
@@ -351,6 +353,8 @@ class ESP32UDPConnection(QObject):
                     message = json.loads(
                         data.decode("utf-8")
                     )
+
+                    print(f"[DAQ] UDP RX: {message}")
 
                 except Exception as e:
 
@@ -513,7 +517,11 @@ class ESP32UDPConnection(QObject):
 
     def set_state(self, state):
 
-        self.state = str(state)
+        new_state = str(state).upper()
+        if self.state == new_state:
+            return
+
+        self.state = new_state
 
         self.stateChanged.emit(
             self.state
@@ -545,20 +553,14 @@ class ESP32UDPConnection(QObject):
     # ========================================================
 
     def run(self):
-
-        return self.send({
-            "command": "RUN"
-        })
+        return self.send({"command": "RUN"})
 
     # ========================================================
     # STOP
     # ========================================================
 
     def stop(self):
-
-        return self.send({
-            "command": "STOP"
-        })
+        return self.send({"command": "STOP"})
 
     # ========================================================
     # THROTTLE

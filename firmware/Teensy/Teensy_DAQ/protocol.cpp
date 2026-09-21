@@ -7,12 +7,46 @@ namespace {
   const uint32_t kTelemetryIntervalMs = 1000UL / TELEMETRY_HZ;
   uint32_t gNextId = 1;
   uint32_t gLastTelemetryMs = 0;
+  // UART bytes do not necessarily arrive in one loop iteration.  Keep each
+  // port's partial line so ESP32 commands are not discarded mid-command.
+  String gUsbRxBuffer;
+  String gEsp32RxBuffer;
 
   String trimString(const String& value) {
     String result = value;
     result.trim();
     return result;
   }
+
+  void processPort(Stream& port, String& buffer, const char* portName) {
+    while (port.available()) {
+      const char ch = static_cast<char>(port.read());
+      if (ch == '\n' || ch == '\r') {
+        if (buffer.length() > 0) {
+          String response;
+          if (processProtocolLine(buffer, response)) {
+            port.println(response);
+#if DEBUG_MODE
+            Serial.print("[TEENSY] ");
+            Serial.print(portName);
+            Serial.print(" RX: ");
+            Serial.println(buffer);
+#endif
+          }
+          buffer = "";
+        }
+        continue;
+      }
+
+      if (buffer.length() >= kMaxLineLength - 1) {
+        buffer = "";
+        port.println(buildError("PROTOCOL", "INVALID_COMMAND", gNextId++));
+      } else {
+        buffer += ch;
+      }
+    }
+  }
+
 }
 
 String buildAck(const String& command, uint32_t id) {
@@ -44,6 +78,14 @@ String buildTelemetryMessage() {
 bool processProtocolLine(const String& line, String& response) {
   String input = trimString(line);
   if (input.length() == 0) {
+    return false;
+  }
+
+  // Responses and telemetry are never commands.  Ignoring them here prevents
+  // feedback loops if a line is ever reflected onto the shared UART.
+  if (input.startsWith("TLM|") || input.startsWith("TELEMETRY|") ||
+      input.startsWith("ACK|") || input.startsWith("ERROR|")) {
+    response = "";
     return false;
   }
 
@@ -104,6 +146,10 @@ bool processProtocolLine(const String& line, String& response) {
   if (input == START_COMMAND) {
     if (gDaqState == STATE_IDLE || gDaqState == STATE_READY || gDaqState == STATE_STOPPED) {
       setDaqState(STATE_RUNNING);
+#if DEBUG_MODE
+      Serial.println("[TEENSY] DAQ_START accepted");
+      Serial.println("[TEENSY] DAQ state -> RUNNING");
+#endif
       response = buildAck(START_COMMAND, gNextId++) + "|state=RUNNING";
       return true;
     }
@@ -119,6 +165,10 @@ bool processProtocolLine(const String& line, String& response) {
 
   if (input == STOP_COMMAND) {
     setDaqState(STATE_STOPPED);
+#if DEBUG_MODE
+    Serial.println("[TEENSY] STOP accepted");
+    Serial.println("[TEENSY] DAQ state -> STOPPED");
+#endif
     response = buildAck(STOP_COMMAND, gNextId++) + "|state=STOPPED";
     return true;
   }
@@ -132,39 +182,19 @@ void protocolSetup() {
 }
 
 void protocolLoop() {
-  auto processPort = [](Stream& port) {
-    String line;
-    while (port.available()) {
-      char ch = static_cast<char>(port.read());
-      if (ch == '\n' || ch == '\r') {
-        if (line.length() > 0) {
-          String response;
-          if (processProtocolLine(line, response)) {
-            port.println(response);
-          }
-          line = "";
-        }
-        continue;
-      }
-
-      if (line.length() < (kMaxLineLength - 1)) {
-        line += ch;
-      } else {
-        line = "";
-        port.println(buildError("PROTOCOL", "INVALID_COMMAND", gNextId++));
-      }
-    }
-  };
-
-  processPort(Serial);
-  processPort(Serial1);
+  processPort(Serial, gUsbRxBuffer, "USB");
+  processPort(Serial2, gEsp32RxBuffer, "ESP32");
 
   if (gDaqState == STATE_RUNNING) {
     uint32_t now = millis();
     if (now - gLastTelemetryMs >= kTelemetryIntervalMs) {
       gLastTelemetryMs = now;
       String telemetry = buildTelemetryMessage();
-      Serial1.println(telemetry);
+      Serial2.println(telemetry);
+#if DEBUG_MODE
+      Serial.print("[TEENSY] TLM TX: ");
+      Serial.println(telemetry);
+#endif
     }
   }
 }

@@ -9,12 +9,12 @@
 #define WIFI_PASSWORD "gsv#2025"
 #define MDNS_NAME "engine-daq"
 #define THROTTLE_SERVO_PIN 9
-#define STATUS_LED_PIN 2
+#define STATUS_LED_PIN 8
 #define STATUS_LED_DIM_PERCENT 20
 #define STATUS_LED_DIM_LEVEL 51
 #define TEENSY_UART_BAUD 115200
-#define TEENSY_RX_PIN 17   // ESP32-C6 RX to Teensy TX
-#define TEENSY_TX_PIN 16   // ESP32-C6 TX to Teensy RX
+#define TEENSY_RX_PIN 17   // ESP32 RX from Teensy TX
+#define TEENSY_TX_PIN 16   // ESP32 TX to Teensy RX
 #define TELEMETRY_HZ 60
 #define GUI_TIMEOUT_MS 3000
 #define TEENSY_TIMEOUT_MS 2000

@@ -76,7 +76,7 @@ import math
 
 PORT = "COM14"
 
-BAUD = 115200
+BAUD = 921600
 
 DEBUG_SERIAL = False
 
@@ -153,9 +153,27 @@ NEXTION = {
 
     "waveform": {
 
-        "object_id": 2,
+        # Existing RPM waveform
+        "rpm": {
+            "object_id": 2,
+            "channel": 0
+        },
 
-        "channel": 0
+        # Added vibration waveforms
+        "vibration_x": {
+            "object_id": 3,
+            "channel": 0
+        },
+
+        "vibration_y": {
+            "object_id": 4,
+            "channel": 0
+        },
+
+        "vibration_z": {
+            "object_id": 5,
+            "channel": 0
+        }
     }
 }
 
@@ -1071,7 +1089,8 @@ def map_thrust_gauge(
         0,
         7,
         0,
-        270
+        245
+
     )
 
 
@@ -1084,7 +1103,7 @@ def map_fuel_gauge(
         0,
         100,
         0,
-        270
+        245
     )
 
 
@@ -1097,7 +1116,7 @@ def map_cht_gauge(
         0,
         250,
         0,
-        270
+        245
     )
 
 
@@ -1110,7 +1129,7 @@ def map_egt_gauge(
         0,
         800,
         0,
-        270
+        245
     )
 
 
@@ -1122,6 +1141,19 @@ def map_rpm_waveform(
         rpm,
         0,
         8000,
+        0,
+        255
+    )
+
+
+def map_vibration_waveform(
+    vibration
+):
+
+    return scale(
+        vibration,
+        0,
+        60,
         0,
         255
     )
@@ -1545,10 +1577,52 @@ def main():
                 # ------------------------------------------------------------
 
                 display.add_waveform_point(
-                    NEXTION["waveform"]["object_id"],
-                    NEXTION["waveform"]["channel"],
+                    NEXTION["waveform"]["rpm"]["object_id"],
+                    NEXTION["waveform"]["rpm"]["channel"],
                     map_rpm_waveform(
                         engine.rpm
+                    )
+                )
+
+
+                # ------------------------------------------------------------
+                # VIBRATION X WAVEFORM
+                # Nextion component ID = 3
+                # ------------------------------------------------------------
+
+                display.add_waveform_point(
+                    NEXTION["waveform"]["vibration_x"]["object_id"],
+                    NEXTION["waveform"]["vibration_x"]["channel"],
+                    map_vibration_waveform(
+                        engine.vib_x
+                    )
+                )
+
+
+                # ------------------------------------------------------------
+                # VIBRATION Y WAVEFORM
+                # Nextion component ID = 4
+                # ------------------------------------------------------------
+
+                display.add_waveform_point(
+                    NEXTION["waveform"]["vibration_y"]["object_id"],
+                    NEXTION["waveform"]["vibration_y"]["channel"],
+                    map_vibration_waveform(
+                        engine.vib_y
+                    )
+                )
+
+
+                # ------------------------------------------------------------
+                # VIBRATION Z WAVEFORM
+                # Nextion component ID = 5
+                # ------------------------------------------------------------
+
+                display.add_waveform_point(
+                    NEXTION["waveform"]["vibration_z"]["object_id"],
+                    NEXTION["waveform"]["vibration_z"]["channel"],
+                    map_vibration_waveform(
+                        engine.vib_z
                     )
                 )
 
