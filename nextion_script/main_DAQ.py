@@ -161,6 +161,11 @@ SYNC1 = 0xAA
 SYNC2 = 0x55
 PACKET_TYPE_ACCEL = 0x01
 
+# Teensy global-throttle status packet:
+# AA 55 02 02 00 THROTTLE_X10_L THROTTLE_X10_H CRC_L CRC_H
+TELEMETRY_TYPE_STATUS = 0x02
+TELEMETRY_STATUS_BYTES = 2
+
 HEADER_SIZE = 5
 CRC_SIZE = 2
 
@@ -180,6 +185,15 @@ temp1 = float("nan")
 temp2 = float("nan")
 
 rpm = float("nan")
+
+# ============================================================
+# GLOBAL THROTTLE SYNCHRONIZATION
+# ============================================================
+# Teensy is authoritative. Nextion -> Teensy -> status packet -> DAQ UI.
+# DAQ UI -> THROTTLE command -> Teensy -> Nextion + servo.
+teensy_throttle_percent = 0.0
+teensy_throttle_lock = threading.Lock()
+TEENSY_SERVO_PIN = 26
 
 serial_connected = False
 running = True
@@ -328,7 +342,7 @@ def process_text_line(line):
     global logging_active, active_log_filename, log_record_count
     global download_active, download_expected_size, download_received_size
     global download_filename, download_last_status, download_stream_mode
-    global download_end_crc16
+    global download_end_crc16, teensy_throttle_percent
 
     s = line.strip()
     if not s:
@@ -483,6 +497,18 @@ def process_text_line(line):
             pass
         return
 
+    # ---------------- GLOBAL THROTTLE TEXT FALLBACK ----------------
+    # Supports firmware builds that also print a human-readable throttle line.
+    if upper.startswith("THROTTLE GLOBAL ="):
+        try:
+            value_text = s.split("=", 1)[1].replace("%", "").strip()
+            value = max(0.0, min(100.0, float(value_text)))
+            with teensy_throttle_lock:
+                teensy_throttle_percent = value
+        except (ValueError, IndexError):
+            pass
+        return
+
     # ---------------- SENSOR TEXT ----------------
     if "LOAD CELL #1" in upper:
         text_section = "load1"
@@ -630,6 +656,7 @@ def serial_reader():
     """Continuous USB receiver for Teensy telemetry + SD transfer protocol."""
     global serial_connected, serial_command_serial, running
     global total_samples, good_packets, bad_packets
+    global teensy_throttle_percent
     global last_packet_arrival_wall_time, latest_sample_time, last_packet_sample_count
     global stream_start_wall_time
 
@@ -756,6 +783,31 @@ def serial_reader():
                         with download_lock:
                             ack_offset = download_received_size
                         send_sd_download_ack(ack_offset)
+                    continue
+
+                # AA55 throttle status packet.
+                # TYPE 0x02, COUNT=2, payload=uint16 throttle percent x10.
+                if len(rx) < HEADER_SIZE:
+                    break
+                packet_type = rx[2]
+                count = rx[3] | (rx[4] << 8)
+
+                if (packet_type == TELEMETRY_TYPE_STATUS and
+                        count == TELEMETRY_STATUS_BYTES):
+                    packet_size = HEADER_SIZE + TELEMETRY_STATUS_BYTES + CRC_SIZE
+                    if len(rx) < packet_size:
+                        break
+                    packet = bytes(rx[:packet_size])
+                    del rx[:packet_size]
+                    received_crc = int.from_bytes(packet[-2:], "little")
+                    calculated_crc = crc16_ccitt(packet[2:-2])
+                    if received_crc == calculated_crc:
+                        throttle10 = int.from_bytes(packet[5:7], "little")
+                        value = max(0.0, min(100.0, throttle10 / 10.0))
+                        with teensy_throttle_lock:
+                            teensy_throttle_percent = value
+                    else:
+                        bad_packets += 1
                     continue
 
                 # AA55 acceleration packet.
@@ -5028,6 +5080,54 @@ class Dashboard(QWidget):
         """)
         self.stop_btn.clicked.connect(self.stop_udp_session)
 
+        # ------------------------------------------------------------
+        # GLOBAL THROTTLE SLIDER
+        # ------------------------------------------------------------
+        # Interactive control positioned over the existing vertical bar
+        # to the right of the EGT gauge. It does not remove any existing
+        # gauge/bar; it simply provides the global throttle control.
+        self.throttle_slider = QSlider(Qt.Vertical, self.background)
+        self.throttle_slider.setRange(0, 100)
+        self.throttle_slider.setSingleStep(1)
+        self.throttle_slider.setPageStep(10)
+        self.throttle_slider.setValue(0)
+        self.throttle_slider.setToolTip("Global throttle 0-100%")
+        self.throttle_slider.setStyleSheet("""
+            QSlider::groove:vertical {
+                background: rgba(30,30,30,170);
+                width: 18px;
+                border: 2px solid #777777;
+                border-radius: 9px;
+            }
+            QSlider::sub-page:vertical {
+                background: #19c85a;
+                border-radius: 8px;
+            }
+            QSlider::add-page:vertical {
+                background: rgba(90,90,90,180);
+                border-radius: 8px;
+            }
+            QSlider::handle:vertical {
+                background: #f2f2f2;
+                border: 2px solid #222222;
+                height: 24px;
+                margin: 0 -6px;
+                border-radius: 12px;
+            }
+            QSlider::handle:vertical:hover {
+                background: #ffffff;
+            }
+        """)
+        self.throttle_slider.valueChanged.connect(self._daq_throttle_changed)
+
+        self.throttle_value_label = QLabel("0%", self.background)
+        self.throttle_value_label.setAlignment(Qt.AlignCenter)
+        self.throttle_value_label.setStyleSheet(
+            "color:#ffffff;background:rgba(20,20,20,190);"
+            "border:1px solid #777777;border-radius:6px;"
+            "font-size:14px;font-weight:bold;padding:2px;"
+        )
+
         # Right-side pages container.
         self.pages = QStackedWidget(self.background)
         self.pages.setStyleSheet("""
@@ -5182,6 +5282,8 @@ class Dashboard(QWidget):
             self.connect_btn,
             self.start_btn,
             self.stop_btn,
+            self.throttle_slider,
+            self.throttle_value_label,
             self.pages,
             self.setup_btn,
             self.exp_btn,
@@ -5328,6 +5430,23 @@ class Dashboard(QWidget):
             )
         )
 
+        # Global throttle control: right of the EGT gauge / over the
+        # existing vertical bar area.
+        self.throttle_slider.setGeometry(
+            *scale_rect(
+                (936, 617, 59, 274),
+                self.width(),
+                self.height()
+            )
+        )
+        self.throttle_value_label.setGeometry(
+            *scale_rect(
+                (927, 578, 77, 32),
+                self.width(),
+                self.height()
+            )
+        )
+
         # Tab buttons from the template.
         self.setup_btn.setGeometry(
             *scale_rect(
@@ -5419,6 +5538,8 @@ class Dashboard(QWidget):
             self.connect_btn,
             self.start_btn,
             self.stop_btn,
+            self.throttle_slider,
+            self.throttle_value_label,
             self.pages,
             self.setup_btn,
             self.exp_btn,
@@ -5442,6 +5563,14 @@ class Dashboard(QWidget):
     # ---------------- Connection status / protocol ----------------
 
     def _zero_live_data(self):
+        if hasattr(self, "throttle_slider"):
+            self.throttle_slider.blockSignals(True)
+            try:
+                self.throttle_slider.setValue(0)
+            finally:
+                self.throttle_slider.blockSignals(False)
+        if hasattr(self, "throttle_value_label"):
+            self.throttle_value_label.setText("0%")
         self.overlay.set_data(
             rpm=0.0,
             thrust=0.0,
@@ -5787,6 +5916,45 @@ class Dashboard(QWidget):
         self.last_data_time = None
         self._set_connection_state("OFFLINE", False)
 
+    def _set_daq_throttle_display(self, value):
+        """Update DAQ throttle UI from Teensy without creating a feedback loop."""
+        value = max(0.0, min(100.0, float(value)))
+        if hasattr(self, "throttle_slider"):
+            self.throttle_slider.blockSignals(True)
+            try:
+                self.throttle_slider.setValue(int(round(value)))
+            finally:
+                self.throttle_slider.blockSignals(False)
+        if hasattr(self, "throttle_value_label"):
+            self.throttle_value_label.setText(f"{value:.0f}%")
+        self.overlay.throttle = value
+        self.overlay.update()
+
+    def _daq_throttle_changed(self, value):
+        """Send DAQ slider value to Teensy global throttle."""
+        value = max(0.0, min(100.0, float(value)))
+        if hasattr(self, "throttle_value_label"):
+            self.throttle_value_label.setText(f"{value:.0f}%")
+        self.overlay.throttle = value
+        self.overlay.update()
+
+        if self.connection_combo.currentText() == "USB / Serial":
+            if serial_connected:
+                ok, msg = send_teensy_command(f"THROTTLE {value:.1f}")
+                if not ok:
+                    print("[DAQ] throttle command failed:", msg)
+            return
+
+        # Preserve existing ESP32/UDP throttle feature.
+        if self.connected:
+            self.send_udp({
+                "type": "set_throttle",
+                "command": "SET_THROTTLE",
+                "protocol": PROTOCOL_VERSION,
+                "throttle_percent": value,
+                "servo_pin": 9,
+            })
+
     def _update_serial_dashboard_data(self):
         """Copy V1 Teensy data into the dashboard gauges and vibration bars."""
         if not serial_connected:
@@ -5802,6 +5970,11 @@ class Dashboard(QWidget):
             current_vx = float(vib_x[-1]) if vib_x else 0.0
             current_vy = float(vib_y[-1]) if vib_y else 0.0
             current_vz = float(vib_z[-1]) if vib_z else 0.0
+
+        with teensy_throttle_lock:
+            current_throttle = float(teensy_throttle_percent)
+
+        self._set_daq_throttle_display(current_throttle)
 
         # V1 Teensy labels:
         #   Load cell #1 = 10 kg -> thrust gauge, grams
@@ -6033,7 +6206,7 @@ class Dashboard(QWidget):
         if self.connection_combo.currentText() == "USB / Serial":
             # The V1 Teensy command path remains available. If the Teensy
             # firmware accepts a throttle command, this forwards it directly.
-            send_teensy_command(f"SET_THROTTLE {value:.2f}")
+            send_teensy_command(f"THROTTLE {value:.2f}")
             return
 
         if self.connected:

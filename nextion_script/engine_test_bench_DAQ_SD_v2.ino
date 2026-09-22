@@ -4,6 +4,7 @@
 #include "HX711.h"
 #include <string.h>
 #include <strings.h>
+#include <Servo.h>
 #include <ctype.h>
 
 // ======================================================
@@ -35,10 +36,6 @@
 #define NEXTION_UPDATE_PERIOD_MS    100
 #define NEXTION_THROTTLE_READ_MS    100
 
-// Larger buffers are important at 921600 baud.
-static uint8_t nextionRxExtra[2048];
-static uint8_t nextionTxExtra[1024];
-
 // Exact component names from the supplied Python engine-model reference.
 #define NEXTION_RPM                 "rpm"
 #define NEXTION_THRUST              "thrust"
@@ -52,6 +49,15 @@ static uint8_t nextionTxExtra[1024];
 #define NEXTION_EGT_GAUGE           "ehtGauge"
 #define NEXTION_THROTTLE_SLIDER     "throtleSlider"
 #define NEXTION_THROTTLE_TEXT       "throtle"
+
+// ---------------------- THROTTLE SERVO ----------------------
+// The single global throttlePercent controls the physical servo.
+// Teensy 4.1 GPIO 26 is the servo signal output.
+#define THROTTLE_SERVO_PIN          26
+#define THROTTLE_SERVO_MIN_US       1000
+#define THROTTLE_SERVO_MAX_US       2000
+#define THROTTLE_SERVO_UPDATE_US    1000
+#define NEXTION_THROTTLE_VALUE      "throtle"   // throtle.val
 #define NEXTION_VIB_X               "vibX"
 #define NEXTION_VIB_Y               "vibY"
 #define NEXTION_VIB_Z               "vibZ"
@@ -269,6 +275,10 @@ uint32_t lastDisplayMs = 0;
 // Nextion is the physical input; the laptop can also issue THROTTLE <0..100>.
 float throttlePercent = 0.0f;
 
+Servo throttleServo;
+bool throttleServoReady = false;
+int lastThrottleServoValue = -1;
+
 float latestVibrationX_g = 0.0f;
 float latestVibrationY_g = 0.0f;
 float latestVibrationZ_g = 0.0f;
@@ -282,6 +292,65 @@ uint32_t lastNextionDisplayMs = 0;
 uint32_t lastNextionThrottleRequestMs = 0;
 int lastNextionThrottleSent = -1;
 
+
+
+// ======================================================
+// THROTTLE SERVO OUTPUT
+// ======================================================
+// IMPORTANT: every source of throttle (Nextion or laptop DAQ)
+// updates the same global throttlePercent. This function converts
+// that global value to the servo PWM pulse on Teensy pin 26.
+//
+// 0%   -> 1000 us
+// 50%  -> 1500 us
+// 100% -> 2000 us
+// ======================================================
+
+void updateThrottleServo()
+{
+  if (!throttleServoReady)
+    return;
+
+  float percent = constrain(throttlePercent, 0.0f, 100.0f);
+  int value = (int)lroundf(percent);
+
+  // Avoid continuously rewriting the same pulse.
+  if (value == lastThrottleServoValue)
+    return;
+
+  uint16_t pulseUs = (uint16_t)lroundf(
+      THROTTLE_SERVO_MIN_US +
+      (percent / 100.0f) *
+      (float)(THROTTLE_SERVO_MAX_US - THROTTLE_SERVO_MIN_US));
+
+  pulseUs = constrain(
+      pulseUs,
+      (uint16_t)THROTTLE_SERVO_MIN_US,
+      (uint16_t)THROTTLE_SERVO_MAX_US);
+
+  throttleServo.writeMicroseconds(pulseUs);
+  lastThrottleServoValue = value;
+}
+
+void initThrottleServo()
+{
+  throttleServo.attach(
+      THROTTLE_SERVO_PIN,
+      THROTTLE_SERVO_MIN_US,
+      THROTTLE_SERVO_MAX_US);
+
+  throttleServoReady = true;
+  lastThrottleServoValue = -1;
+
+  // Start from the current global throttle.
+  updateThrottleServo();
+
+  Serial.print("THROTTLE SERVO: pin ");
+  Serial.print(THROTTLE_SERVO_PIN);
+  Serial.print(" initial throttle = ");
+  Serial.print(throttlePercent, 1);
+  Serial.println(" %");
+}
 
 // ======================================================
 // NEXTION DISPLAY - DIRECT TEENSY UART
@@ -350,8 +419,13 @@ void nextionSetThrottleSlider(float percent)
   // the slider without the MCU continuously fighting the touch input.
   if (lastNextionThrottleSent != value)
   {
+    // Keep BOTH Nextion numeric controls synchronized:
+    //   throtleSlider.val = global throttle
+    //   throtle.val       = global throttle
     nextionSetNumeric(NEXTION_THROTTLE_SLIDER, value);
+    nextionSetNumeric(NEXTION_THROTTLE_VALUE, value);
 
+    // Preserve the existing text update feature as well.
     char text[16];
     snprintf(text, sizeof(text), "%d%%", value);
     nextionSetText(NEXTION_THROTTLE_TEXT, text);
@@ -397,6 +471,9 @@ void nextionProcessRx()
             ((uint32_t)buffer[4] << 24);
 
         throttlePercent = constrain((float)value, 0.0f, 100.0f);
+
+        // Nextion -> global throttle -> physical servo.
+        updateThrottleServo();
       }
 
       count = 0;
@@ -404,7 +481,9 @@ void nextionProcessRx()
   }
 }
 
-// Forward declarations required because telemetry declarations are defined later.
+// ======================================================
+// COMPILE FIX: forward declarations
+// ======================================================
 extern bool telemetryEnabled;
 uint16_t crc16_ccitt(const uint8_t *data, uint16_t length);
 
@@ -507,9 +586,7 @@ void nextionUpdateDisplay()
 
 void nextionBegin()
 {
-  NEXTION_SERIAL.addMemoryForRead(nextionRxExtra, sizeof(nextionRxExtra));
-  NEXTION_SERIAL.addMemoryForWrite(nextionTxExtra, sizeof(nextionTxExtra));
-  NEXTION_SERIAL.begin(NEXTION_BAUD, SERIAL_8N1);
+  NEXTION_SERIAL.begin(NEXTION_BAUD);
   delay(50);
 
   while (NEXTION_SERIAL.available())
@@ -517,7 +594,7 @@ void nextionBegin()
 
   nextionSetThrottleSlider(throttlePercent);
 
-  Serial.println("NEXTION: Serial6 RX=25 TX=24 @ 921600");
+  Serial.println("NEXTION: Serial6 RX=25 TX=24 @ 115200");
 }
 
 void serviceNextion()
@@ -640,6 +717,8 @@ void nextionSetNumeric(const char *component, long value);
 void nextionSetText(const char *component, const char *text);
 void nextionSetThrottleSlider(float percent);
 void sendThrottleStatusTelemetry();
+void updateThrottleServo();
+void initThrottleServo();
 void serviceNextion();
 
 float rawToVoltage(uint16_t raw);
@@ -1764,7 +1843,7 @@ static void handleSDListCommand()
 // CRC covers TYPE + OFFSET + LENGTH + DATA.
 // ======================================================
 
-static void sendSDDataFrame(uint32_t offset,
+__attribute__((unused)) static void sendSDDataFrame(uint32_t offset,
                             const uint8_t *data,
                             uint16_t length,
                             uint16_t &fileCRC)
@@ -2196,6 +2275,9 @@ void handleSerialCommand()
         {
           float value = serialCommand.substring(spaceIndex + 1).toFloat();
           throttlePercent = constrain(value, 0.0f, 100.0f);
+
+          // Laptop DAQ -> global throttle -> servo + Nextion.
+          updateThrottleServo();
           nextionSetThrottleSlider(throttlePercent);
 
           Serial.print("THROTTLE GLOBAL = ");
@@ -2419,6 +2501,11 @@ void setup()
   Serial.begin(SERIAL_BAUD);
 
   // USB Serial remains the laptop DAQ connection.
+
+  // Initialize the physical throttle servo on Teensy pin 26.
+  // It follows the same global throttlePercent used by Nextion and DAQ.
+  initThrottleServo();
+
   // Nextion uses the separate Serial6 UART.
   nextionBegin();
 
@@ -2714,4 +2801,9 @@ void loop()
 
   // 5. Nextion display + global throttle synchronization
   serviceNextion();
+
+  // 6. Keep the physical servo locked to the global throttle value.
+  // This is intentionally non-blocking and only writes when the
+  // integer throttle value changes.
+  updateThrottleServo();
 }
